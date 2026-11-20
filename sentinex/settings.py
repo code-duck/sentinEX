@@ -3,13 +3,21 @@
 from pathlib import Path
 import os
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 
 APP_ROOT = Path(__file__).resolve().parent.parent
-load_dotenv(APP_ROOT / ".env")
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+
+def get_setting(name: str, default: str = "") -> str:
+    """Read process configuration first, then the project-local .env file."""
+    value = os.getenv(name)
+    if value:
+        return value
+    file_value = dotenv_values(APP_ROOT / ".env").get(name)
+    return str(file_value) if file_value else default
+
+GEMINI_MODEL = get_setting("GEMINI_MODEL", "gemini-3.8-flash")
 SOURCE_EXTENSIONS = frozenset({".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".php", ".rb"})
 EXCLUDED_DIRECTORIES = frozenset({
     ".git", ".venv", "venv", "node_modules", "vendor", "dist", "build",

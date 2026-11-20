@@ -16,6 +16,11 @@ DEFAULT_TIMEOUT_SECONDS = 600
 _IMAGE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,254}$")
 
 
+def _shell_quote(value: str) -> str:
+    """Quote a user-approved command as one POSIX shell argument."""
+    return "'" + value.replace("'", "'\"'\"'") + "'"
+
+
 class DockerTestError(RuntimeError):
     """Raised when restricted test execution cannot be started safely."""
 
@@ -31,7 +36,7 @@ class DockerTestResult:
     duration_seconds: float
 
 
-def _docker_executable() -> str:
+def docker_executable() -> str:
     """Find the Docker CLI without relying on a stale terminal PATH."""
     executable = shutil.which("docker")
     if executable:
@@ -72,9 +77,9 @@ def run_restricted_tests(
     command: str,
     timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS,
 ) -> DockerTestResult:
-    """Run a one-line, user-approved command with no network and read-only source."""
+    """Run approved tests against a disposable copy, leaving project files untouched."""
     project_root = _validate_inputs(root, image.strip(), command.strip())
-    docker = _docker_executable()
+    docker = docker_executable()
 
     try:
         info = subprocess.run(
@@ -104,19 +109,27 @@ def run_restricted_tests(
         "--read-only",
         "--cap-drop=ALL",
         "--security-opt=no-new-privileges",
+        "--user=65534:65534",
         "--pids-limit=128",
         "--memory=2g",
         "--cpus=2",
         "--tmpfs",
         "/tmp:rw,noexec,nosuid,nodev,size=256m",
         "--mount",
-        f"type=bind,source={mount_path},target=/workspace,readonly",
+        f"type=bind,source={mount_path},target=/input,readonly",
+        "--tmpfs",
+        "/workspace:rw,nosuid,nodev,size=2g,uid=65534,gid=65534,mode=0700",
         "--workdir",
-        "/workspace",
+        "/tmp",
+        "--env",
+        "HOME=/tmp",
+        "--env",
+        "PYTHONDONTWRITEBYTECODE=1",
         image.strip(),
         "sh",
         "-lc",
-        command.strip(),
+        "cp -a /input/. /workspace/ && cd /workspace && exec sh -lc "
+        + _shell_quote(command.strip()),
     ]
 
     started = time.monotonic()
