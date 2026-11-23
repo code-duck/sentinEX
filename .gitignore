@@ -6,3 +6,4 @@ __pycache__/
 *.py[cod]
 .semgrep/
 .scan-results/
+logs/

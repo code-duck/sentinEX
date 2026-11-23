@@ -1,5 +1,5 @@
 streamlit
 google-genai
-mcp
+mcp>=1.29,<2
 python-dotenv
 semgrep

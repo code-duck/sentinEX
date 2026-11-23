@@ -31,7 +31,19 @@ def _client() -> genai.Client:
 
 
 def _generate(prompt: str) -> str:
-    response = _client().models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    client = _client()
+    try:
+        with client:
+            response = client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
+    except AIReviewError:
+        raise
+    except Exception as error:
+        if getattr(error, "code", None) == 503 or "503" in str(error) or "UNAVAILABLE" in str(error):
+            raise AIReviewError(
+                "Gemini is temporarily overloaded (503). Retry the request shortly; "
+                "SentinEX did not apply any patch."
+            ) from error
+        raise AIReviewError(f"Gemini request failed: {error}") from error
     return response.text or ""
 
 

@@ -1,6 +1,9 @@
 """Publish an approved SentinEX branch and open a draft PR through GitHub MCP."""
 
 import asyncio
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import re
@@ -16,6 +19,14 @@ from .settings import get_setting
 
 class PullRequestError(RuntimeError):
     """Raised when branch publishing or MCP pull-request creation fails."""
+
+
+@dataclass(frozen=True)
+class PullRequestInfo:
+    """GitHub pull request created by SentinEX."""
+
+    number: int
+    url: str
 
 
 def github_mcp_token_configured() -> bool:
@@ -71,20 +82,14 @@ def _target_branch(root: Path) -> str:
     )
 
 
-async def _create_pr_with_mcp(
-    root: Path,
-    owner: str,
-    repository: str,
-    branch: str,
-    base: str,
-    title: str,
-    body: str,
-) -> str:
+@asynccontextmanager
+async def _github_session(root: Path):
+    """Open one official GitHub MCP server session for the selected repository."""
     token = get_setting("GITHUB_PERSONAL_ACCESS_TOKEN").strip()
     if not token:
         raise PullRequestError(
             "Set GITHUB_PERSONAL_ACCESS_TOKEN in E:\\SentinEX\\.env. "
-            "Use a fine-grained token limited to this repository with pull-request write access."
+            "Use a fine-grained token limited to this repository."
         )
 
     try:
@@ -110,34 +115,85 @@ async def _create_pr_with_mcp(
         async with stdio_client(parameters) as (read_stream, write_stream):
             async with ClientSession(read_stream, write_stream) as session:
                 await session.initialize()
-                response = await session.call_tool(
-                    "create_pull_request",
-                    arguments={
-                        "owner": owner,
-                        "repo": repository,
-                        "title": title,
-                        "head": branch,
-                        "base": base,
-                        "body": body,
-                        "draft": True,
-                    },
-                )
+                yield session
+    except PullRequestError:
+        raise
     except Exception as error:
         raise PullRequestError(f"GitHub MCP request failed: {error}") from error
 
+
+def _response_text(response) -> str:
     if response.isError:
         details = "\n".join(
             block.text for block in response.content if getattr(block, "text", None)
         )
-        raise PullRequestError(details or "GitHub MCP could not create the pull request.")
-
-    details = "\n".join(
+        raise PullRequestError(details or "GitHub MCP action failed.")
+    return "\n".join(
         block.text for block in response.content if getattr(block, "text", None)
     )
+
+
+async def _create_pr_with_mcp(
+    root: Path,
+    owner: str,
+    repository: str,
+    branch: str,
+    base: str,
+    title: str,
+    body: str,
+) -> PullRequestInfo:
+    async with _github_session(root) as session:
+        response = await session.call_tool(
+            "create_pull_request",
+            arguments={
+                "owner": owner,
+                "repo": repository,
+                "title": title,
+                "head": branch,
+                "base": base,
+                "body": body,
+                "draft": True,
+            },
+        )
+
+    details = _response_text(response)
+    candidates = [details]
     structured = getattr(response, "structuredContent", None)
-    if structured:
-        details = f"{details}\n{structured}".strip()
-    return details or "GitHub MCP created a draft pull request."
+    if structured is not None:
+        candidates.append(str(structured))
+        if isinstance(structured, dict):
+            pull_request = structured.get("pull_request") or structured.get("pullRequest")
+            if isinstance(pull_request, dict):
+                candidates.append(str(pull_request.get("url", "")))
+            candidates.append(str(structured.get("url", "")))
+
+    url = ""
+    number = None
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            payload = json.loads(candidate)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            url = str(payload.get("url", "") or url)
+            nested = payload.get("pull_request") or payload.get("pullRequest")
+            if isinstance(nested, dict):
+                url = str(nested.get("url", "") or url)
+        match = re.search(r"https://github\.com/[^\s/]+/[^\s/]+/pull/(\d+)", url or candidate)
+        if match:
+            number = int(match.group(1))
+            if not url:
+                url = match.group(0)
+            break
+
+    if number is None or not url:
+        raise PullRequestError(
+            "GitHub reported that the draft PR was created, but SentinEX could not read its URL and number. "
+            f"Check the repository's Pull requests page before retrying. MCP response: {details[:500]}"
+        )
+    return PullRequestInfo(number=number, url=url)
 
 
 def publish_as_draft_pr(
@@ -146,7 +202,7 @@ def publish_as_draft_pr(
     title: str,
     body: str,
     base: str | None = None,
-) -> str:
+) -> PullRequestInfo:
     """Push exactly one approved patch branch, then create a draft PR using MCP."""
     root = root.resolve(strict=True)
     if not branch.startswith("sentinex/fix-"):
@@ -215,6 +271,47 @@ def publish_as_draft_pr(
                 _create_pr_with_mcp(root, owner, repository, branch, target, title.strip(), body.strip()),
                 timeout=120,
             )
+        )
+    except TimeoutError as error:
+        raise PullRequestError("GitHub MCP did not respond within two minutes.") from error
+
+
+async def _merge_pr_with_mcp(root: Path, owner: str, repository: str, number: int) -> str:
+    async with _github_session(root) as session:
+        ready_response = await session.call_tool(
+            "update_pull_request",
+            arguments={
+                "owner": owner,
+                "repo": repository,
+                "pullNumber": number,
+                "draft": False,
+            },
+        )
+        _response_text(ready_response)
+        merge_response = await session.call_tool(
+            "merge_pull_request",
+            arguments={
+                "owner": owner,
+                "repo": repository,
+                "pullNumber": number,
+                "merge_method": "squash",
+            },
+        )
+    return _response_text(merge_response) or f"Pull request #{number} merged."
+
+
+def merge_approved_pull_request(root: Path, number: int) -> str:
+    """Merge a SentinEX draft PR only after the user explicitly approves in the UI."""
+    if not isinstance(number, int) or number < 1:
+        raise PullRequestError("The pull request number is invalid.")
+    owner, repository = _repository_slug(root)
+    if not get_setting("GITHUB_PERSONAL_ACCESS_TOKEN").strip():
+        raise PullRequestError(
+            "Set GITHUB_PERSONAL_ACCESS_TOKEN in E:\\SentinEX\\.env before merging."
+        )
+    try:
+        return asyncio.run(
+            asyncio.wait_for(_merge_pr_with_mcp(root, owner, repository, number), timeout=120)
         )
     except TimeoutError as error:
         raise PullRequestError("GitHub MCP did not respond within two minutes.") from error

@@ -33,7 +33,6 @@ jsonschema-specifications==2025.9.1
 markdown-it-py==4.3.0
 MarkupSafe==3.0.4
 mcp==1.29.0
-mcp-types==2.3.0
 mdurl==0.1.2
 narwhals==2.29.0
 numpy==2.5.5

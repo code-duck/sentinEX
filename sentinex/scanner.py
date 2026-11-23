@@ -72,6 +72,8 @@ def _scan_with_docker(root: Path) -> list[dict]:
         "-e",
         "SEMGREP_SEND_METRICS=off",
         "-e",
+        "HOME=/tmp",
+        "-e",
         "SEMGREP_LOG_FILE=/tmp/semgrep.log",
         "-e",
         "SEMGREP_VERSION_CACHE_PATH=/tmp/semgrep-version-cache",
@@ -85,6 +87,8 @@ def _scan_with_docker(root: Path) -> list[dict]:
             cwd=root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=600,
             check=False,
             shell=False,
@@ -117,6 +121,8 @@ def scan_project(root: Path) -> list[dict]:
             cwd=root,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=300,
             check=False,
             shell=False,
@@ -125,6 +131,11 @@ def scan_project(root: Path) -> list[dict]:
     except subprocess.TimeoutExpired as error:
         raise ScanError("Semgrep scan timed out after five minutes.") from error
     except OSError as error:
+        return _scan_with_docker(root)
+
+    if sys.platform == "win32" and (
+        result.returncode not in (0, 1) or not result.stdout.strip()
+    ):
         return _scan_with_docker(root)
 
     if result.returncode not in (0, 1):

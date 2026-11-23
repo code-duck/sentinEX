@@ -1,65 +1,139 @@
 # SentinEX
 
-SentinEX is a local application-security review prototype. It scans eligible source code in one selected folder with Semgrep, sends findings and nearby code context to Gemini when configured, and offers a separate full AI review action.
+SentinEX is a local-first application security review prototype. It combines Semgrep Community Edition findings with Gemini explanations and proposed patches, then guides a developer through local approval, a GitHub draft pull request, isolated tests, a rescan, and an explicitly approved merge.
 
-## Current state
+Its intended first users are AI-assisted solo developers and small software teams that use GitHub but do not have a dedicated application security specialist. SentinEX is a developer aid; it does not replace a security review or guarantee that code is vulnerability-free.
 
-- Local Streamlit UI and selected-folder scan flow.
-- Eligible source languages: Python, JavaScript, TypeScript, Java, Go, PHP, Ruby.
-- Semgrep findings can be previewed with redacted nearby context before an explicit Gemini analysis request.
-- Full AI Review previews eligible files in bounded chunks before an explicit Gemini request.
-- Gemini can draft a minimal unified diff for a finding. The developer must inspect and approve it before SentinEX applies it to a new local Git branch.
-- Patch application requires a clean Git working tree and refuses paths outside the selected project.
-- Developer-approved test commands can run in Docker against a disposable copy of the selected project. The host project is mounted read-only; the container has no network, dropped Linux capabilities, and CPU, memory, process, and time limits.
-- After the container run, SentinEX rescans the project with Semgrep and shows the remaining findings.
-- GitHub PRs are opened as drafts through GitHub's official MCP server after explicit developer approval; SentinEX does not merge them.
-- Semgrep does not guarantee complete vulnerability detection.
+## What it does
 
-## Code layout
+- Opens a selected project folder with the Windows folder picker or accepts a path.
+- Runs Semgrep using the `p/security-audit` ruleset. The scanner recognizes rule-matched code patterns; unique code may still contain issues the rules do not cover.
+- Shows findings and a preview of the redacted finding context before **Analyze with Gemini** sends it.
+- Offers **Ask Gemini for a patch** for an individual finding. Gemini proposes a diff; it does not edit files by itself.
+- Shows the diff and changes the selected project only after the developer approves it. Patch application is restricted to a clean Git repository, a new SentinEX branch, and one file.
+- After patch approval, offers a separate confirmation to push the branch and create a GitHub draft PR.
+- After draft PR creation, runs a developer-entered test command in Docker, then rescans with Semgrep. A merge action is available only after tests pass and the developer explicitly approves it. Remaining findings must be acknowledged.
+- Provides **Get full AI review** as a separate action. Clicking it sends eligible source code to Gemini in bounded chunks; the app displays the prepared chunks after that request. Review code and secrets policy before using this action.
+- Includes Windows desktop launch and stop scripts. The launcher hides the console, opens the local dashboard, and saves server output in `logs/` (the five most recent launch sessions are retained).
 
-- `app.py` contains the Streamlit interface.
-- `sentinex/project.py` enforces source-file selection and redacts common secrets.
-- `sentinex/scanner.py` runs Semgrep locally and falls back to its official Docker image if Windows blocks the local executable.
-- `sentinex/ai_review.py` handles Gemini explanations, patch proposals, and full review.
-- `sentinex/patching.py` validates a proposed diff and applies it only after approval.
-- `sentinex/docker_runner.py` runs one developer-entered test command with container isolation limits.
-- `sentinex/github_pr.py` publishes the approved fix branch and creates a draft PR through the official GitHub MCP server.
+## Supported code and scan boundaries
+
+SentinEX currently selects these source extensions inside the chosen folder:
+
+| Language | Extensions |
+| --- | --- |
+| Python | `.py` |
+| JavaScript | `.js`, `.jsx` |
+| TypeScript | `.ts`, `.tsx` |
+| Java | `.java` |
+| Go | `.go` |
+| PHP | `.php` |
+| Ruby | `.rb` |
+
+The selector skips common generated or dependency folders such as `.git`, `.venv`, `node_modules`, `vendor`, `dist`, and `build`. It considers up to 500 files and skips files larger than 1.5 MB. Findings analysis includes a limited nearby-code excerpt. Common inline secret formats and Google API key patterns are redacted, but redaction is not comprehensive.
+
+This prototype focuses on application source code. It does not currently provide full infrastructure-as-code, cloud configuration, CI/CD workflow, dependency/SCA, DAST, or binary scanning. Semgrep and AI review can miss vulnerabilities or report false positives.
+
+## Workflow
+
+1. Choose a local project folder and run **Scan project**.
+2. Inspect Semgrep findings. Expand the Gemini preview before choosing **Analyze with Gemini** to request explanations.
+3. For a finding, choose **Ask Gemini for a patch**. Review the proposed diff; then choose **Approve and apply this patch** if you accept it.
+4. Review and confirm the branch push and draft PR creation in SentinEX. GitHub hosts the PR; open its link to review the actual GitHub diff.
+5. Return to SentinEX and enter the project’s test command and a Docker image that already contains its test dependencies. SentinEX runs tests against a disposable copy, then rescans the patched project.
+6. If the test command passes, inspect the PR, test output, and rescan. Explicitly approve the merge in SentinEX to request a squash merge. SentinEX does not deploy the project.
+
+Scanning, patch application, and Docker test execution operate on the developer’s local machine. Gemini requests send the selected code context to Google’s API. GitHub MCP performs PR operations on GitHub. The app cannot merge unless the developer checks the approval box and submits the merge action; repository rules may still reject a merge.
+
+## Technology
+
+| Component | Role |
+| --- | --- |
+| Python | Project scoping, orchestration, patch validation, Git and API workflow |
+| Streamlit | Local browser dashboard |
+| Semgrep CE | Local static analysis with `p/security-audit` |
+| Gemini API (`google-genai`) | Finding explanations, patch proposals, optional whole-project review |
+| Git for Windows | Local branches, commits, and pushing approved changes |
+| Docker Desktop | Semgrep fallback, GitHub MCP container, and restricted test runner |
+| GitHub MCP Server | Create draft PRs, mark them ready, and merge after explicit approval |
+
+Gemini is the only AI provider currently implemented. A self-hosted model option is a possible future feature, not part of this version.
+
+## Requirements
+
+- Windows 10/11, Python 3.14, and Git for Windows.
+- Docker Desktop with the Linux engine running. SentinEX uses it for restricted test runs and the GitHub MCP server; it may also use Docker when Windows blocks the local Semgrep executable.
+- A Gemini API key for explanations, patches, and full AI review. A Gemini consumer subscription does not itself include API usage; API terms and billing/quota depend on the Google AI Studio project.
+- For PR operations, a GitHub fine-grained token limited to the target repository, with repository metadata read access, contents read/write, and pull requests read/write. Git’s configured credential manager is used to push the branch; the token is passed to the GitHub MCP container for PR operations.
 
 ## Setup
 
-Python 3.14 is installed on this machine. Open this folder in VS Code, then use its terminal:
+From PowerShell in the project folder:
 
-    cd E:\SentinEX
-    py -3.14 -m venv .venv
-    .\.venv\Scripts\Activate.ps1
-    python -m pip install -r requirements.lock.txt
+```powershell
+py -3.14 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.lock.txt
+Copy-Item .env.example .env
+```
 
-The current dependency environment is already created at E:\SentinEX\.venv.
+Edit `.env` locally:
 
-## Gemini key
+```dotenv
+GEMINI_API_KEY=your_google_ai_studio_key
+GEMINI_MODEL=gemini-3.8-flash
+GITHUB_PERSONAL_ACCESS_TOKEN=your_repository_scoped_token
+```
 
-Edit the local `.env` file and add your Google AI Studio API key and GitHub fine-grained token when you are ready to use those integrations. The project has a blank `.env` prepared for you:
+Never commit `.env` or paste credentials into public issues or chat. `.env` is ignored by Git. The model name can be changed to a model currently available to your API project. Gemini may return `503 UNAVAILABLE` during service overload; this is an upstream availability issue, not fixed by creating another key.
 
-    GEMINI_API_KEY=your-private-key
-    GEMINI_MODEL=gemini-3.8-flash
-    GITHUB_PERSONAL_ACCESS_TOKEN=your-repository-scoped-token
+## Run SentinEX
 
-Never commit `.env` or paste credentials into chat. Gemini API billing is separate from a Gemini Plus subscription. The GitHub token should be fine-grained and limited to the target repository, with permission to create pull requests. Git's configured credential manager is used to push the branch. The project you scan must have a GitHub `origin` remote and a fetched default branch.
+### Desktop shortcuts (Windows)
 
-## Run
+The desktop **SentinEX** shortcut starts the local server in the background and opens the browser. **Stop SentinEX** stops the server. The launcher scripts and icon assets are in this repository. Logs are stored in `logs/` and are excluded from Git.
 
-    .\.venv\Scripts\python.exe -m streamlit run app.py
+### Terminal
 
-Enter a project folder path in the sidebar and choose Scan project. Expand the Gemini review preview to inspect the exact findings and redacted code context; choose Analyze with Gemini to send it. Expand a finding to ask Gemini for a patch, inspect the diff, and approve it before local application. The separate Full AI Review action previews and sends eligible source files in chunks to Gemini.
+```powershell
+cd E:\SentinEX
+.\.venv\Scripts\python.exe -m streamlit run app.py --server.address 127.0.0.1 --server.port 8501
+```
 
-## Safety notes
+Open `http://127.0.0.1:8501`. Keep the terminal open while the app is running; press **Ctrl+C** to stop it.
 
-- The scanner reads eligible source files only under the selected root and skips common generated/dependency folders.
-- If Windows blocks the local Semgrep executable, the scanner can fall back to the official Semgrep Docker image. That fallback has network access to retrieve the configured rule pack; the selected project stays mounted read-only and source is not sent to Semgrep as an upload.
-- Code is sent to Gemini only when an API key is configured and the user starts the relevant action.
-- Patch changes are applied only after explicit approval, to a clean Git repository, on a new branch.
-- Docker test images must contain the test tools and dependencies already; the container has no network and changes only its disposable copy. Docker Desktop may download a missing image before the container starts.
-- A failing test run is still followed by a Semgrep rescan so the developer can see both outcomes.
-- PR creation requires an `origin` GitHub remote, a published branch, and the GitHub MCP token; SentinEX commits and pushes only the approved single-file patch after a separate confirmation.
-- Draft PRs are opened for human review. SentinEX never merges or deploys.
+## GitHub repository requirements
 
+The project selected for remediation must be the root of a Git repository with a GitHub `origin` remote and a fetched default branch. The current PR path accepts only the approved one-file SentinEX patch commit. Branch pushing uses the developer’s Git credential manager. GitHub MCP runs from Docker using `ghcr.io/github/github-mcp-server:latest` and the repository-scoped token.
+
+SentinEX’s own repository is `https://github.com/code-duck/sentinEX`. The intentionally vulnerable demo repository used for demonstrations is separate: `https://github.com/code-duck/SentinEX-Faulty-Demo`.
+
+## Docker test limits and caveats
+
+The test runner mounts the selected project read-only, copies it into disposable container storage, disables network access, drops Linux capabilities, sets CPU/memory/process limits, and enforces a timeout. These restrictions reduce risk but do not make arbitrary test commands or images perfectly safe. Use trusted project code, test commands, and container images. A missing image may be downloaded before the offline test container starts.
+
+If Windows blocks the local Semgrep executable, the fallback uses the official Semgrep Docker image. That scan may contact Semgrep’s rule registry to fetch the configured rules; the selected source folder is mounted read-only and is not uploaded by SentinEX as a source archive.
+
+## Current prototype limitations
+
+- The Gemini API can be temporarily unavailable or overloaded; AI explanation and patch generation then cannot complete.
+- Full AI Review sends code when clicked and only then displays the prepared chunks; it currently has no separate pre-send confirmation screen.
+- The full GitHub PR, Docker test, rescan, and merge sequence has not yet been demonstrated end to end with a successful Gemini patch. Review the draft PR directly on GitHub before approving any merge.
+- No local/self-hosted model provider, multi-user/team administration, policy management, or enterprise audit console is implemented.
+- Docker resource limits are safeguards, not a complete security boundary.
+
+## Project structure
+
+```text
+app.py                    Streamlit dashboard and workflow
+sentinex/project.py       Selected-folder boundaries, source selection, redaction
+sentinex/scanner.py       Semgrep scan and Docker fallback
+sentinex/ai_review.py     Gemini explanations, patch proposals, full review
+sentinex/patching.py      Approval-gated local patch application
+sentinex/docker_runner.py Restricted Docker test runner
+sentinex/github_pr.py     GitHub MCP draft PR and approved merge operations
+sentinex/folder_picker.py Windows folder picker
+launch_sentinex.ps1       Hidden Windows launcher with local log files
+stop_sentinex.ps1         Verified SentinEX process stop action
+assets/                   Desktop shortcut icons
+```
