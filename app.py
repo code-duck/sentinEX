@@ -1,6 +1,8 @@
 """SentinEX local secure-code review interface."""
 
+import hashlib
 from pathlib import Path
+import re
 
 import streamlit as st
 
@@ -79,17 +81,93 @@ def browse_project_folder() -> None:
         st.session_state["project_path"] = selected
 
 
+def _finding_cwe(finding: dict) -> str:
+    metadata = (finding.get("extra") or {}).get("metadata", {})
+    cwe = metadata.get("cwe", "") if isinstance(metadata, dict) else ""
+    if isinstance(cwe, list):
+        cwe = " ".join(str(value) for value in cwe)
+    match = re.search(r"CWE-\d+", str(cwe), re.IGNORECASE)
+    return match.group(0).upper() if match else ""
+
+
+def link_review_findings(
+    semgrep_findings: list[dict], gemini_findings: list[dict]
+) -> list[dict]:
+    """Link exact-location Gemini findings to Semgrep results; preserve AI-only items."""
+    combined = []
+    for finding in semgrep_findings:
+        linked = dict(finding)
+        linked["sentinex_sources"] = ["Semgrep"]
+        combined.append(linked)
+
+    for ai_finding in gemini_findings:
+        ai_path = str(ai_finding.get("path", "")).casefold()
+        ai_line = ai_finding.get("start", {}).get("line")
+        ai_cwe = _finding_cwe(ai_finding)
+        match = None
+        for candidate in combined:
+            if candidate.get("sentinex_source") == "gemini":
+                continue
+            if candidate.get("sentinex_ai_review"):
+                continue
+            if str(candidate.get("path", "")).casefold() != ai_path:
+                continue
+            candidate_cwe = _finding_cwe(candidate)
+            if ai_cwe and candidate_cwe and ai_cwe != candidate_cwe:
+                continue
+            candidate_line = candidate.get("start", {}).get("line")
+            line_gap = (
+                abs(candidate_line - ai_line)
+                if isinstance(candidate_line, int)
+                else 10_000
+            )
+            if line_gap > (2 if ai_cwe and candidate_cwe else 0):
+                continue
+            match = candidate
+            break
+
+        if match is None:
+            ai_only = dict(ai_finding)
+            ai_only["sentinex_sources"] = ["Gemini Full AI Review"]
+            combined.append(ai_only)
+            continue
+
+        match["sentinex_sources"] = ["Semgrep", "Gemini Full AI Review"]
+        match["sentinex_ai_review"] = ai_finding.get("sentinex_ai_review", {})
+
+    return combined
+
+
+def _finding_key(finding: dict) -> str:
+    ai_review = finding.get("sentinex_ai_review") or {}
+    details = ai_review.get("title") or finding.get("extra", {}).get("message", "")
+    identity = "|".join(
+        (
+            str(finding.get("check_id", "")),
+            str(finding.get("path", "")),
+            str(finding.get("start", {}).get("line", "")),
+            str(details),
+        )
+    )
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
+
+
 def render_findings(findings: list[dict]) -> None:
     """Render scanner results and approval-gated patch actions."""
     workflow_locked = bool(
         st.session_state.get("last_patch_branch")
         and not st.session_state.get("merge_result")
     )
-    st.subheader("Semgrep findings")
+    st.subheader("Security findings")
+    st.caption(
+        "AI-only findings are model-generated leads. Review the evidence and patch carefully; "
+        "Semgrep may not have a rule that can verify them."
+    )
     rows = []
     for finding in findings:
         extra = finding.get("extra", {})
         rows.append({
+            "source": " + ".join(finding.get("sentinex_sources", ["Semgrep"])),
             "severity": extra.get("severity", "INFO"),
             "rule": finding.get("check_id", ""),
             "file": finding.get("path", ""),
@@ -103,15 +181,43 @@ def render_findings(findings: list[dict]) -> None:
         "Inspect each diff and its source. SentinEX applies it only after you approve, "
         "and only to a clean Git repository on a new branch."
     )
+    if len(findings) > 20:
+        st.caption(
+            "Patch cards are shown for the first 20 findings; "
+            "the table above lists all findings."
+        )
     root = Path(st.session_state["project_root"])
-    for index, finding in enumerate(findings[:5]):
+    for finding in findings[:20]:
         location = finding.get("start", {}).get("line", "")
-        label = f"{finding.get('check_id', 'Finding')} - {finding.get('path', '')}:{location}"
+        fingerprint = _finding_key(finding)
+        sources = " + ".join(finding.get("sentinex_sources", ["Semgrep"]))
+        title = (finding.get("sentinex_ai_review") or {}).get("title")
+        label = f"{title or finding.get('check_id', 'Finding')} - {finding.get('path', '')}:{location}"
         with st.expander(label):
-            proposal_key = f"patch_proposal_{index}"
+            st.caption(f"Detected by: {sources}")
+            ai_review = finding.get("sentinex_ai_review") or {}
+            if ai_review:
+                st.write(ai_review.get("description", ""))
+                if ai_review.get("evidence"):
+                    st.caption("Gemini evidence")
+                    st.code(ai_review["evidence"], language="text")
+                if not ai_review.get("evidence_verified", False):
+                    st.warning(
+                        "Gemini's quoted evidence did not match the source exactly near its "
+                        "reported line. Verify the code and diff carefully before approving a patch."
+                    )
+                if ai_review.get("impact"):
+                    st.write("Potential impact:", ai_review["impact"])
+                if ai_review.get("remediation"):
+                    st.write("Suggested remediation:", ai_review["remediation"])
+                confidence = ai_review.get("confidence")
+                if confidence:
+                    st.caption(f"Gemini confidence: {confidence}. Review this finding before acting.")
+
+            proposal_key = f"patch_proposal_{fingerprint}"
             if st.button(
                 "Ask Gemini for a patch",
-                key=f"request_patch_{index}",
+                key=f"request_patch_{fingerprint}",
                 disabled=not api_key_configured() or workflow_locked,
                 help=(
                     "Ask Gemini to suggest a fix. Finish the current patch's PR workflow "
@@ -128,10 +234,14 @@ def render_findings(findings: list[dict]) -> None:
                 except Exception as error:
                     st.error(f"Patch proposal failed: {error}")
 
-            rule_patch = propose_rule_based_patch(root, finding)
+            rule_patch = (
+                propose_rule_based_patch(root, finding)
+                if finding.get("sentinex_source") != "gemini"
+                else None
+            )
             if rule_patch is not None and st.button(
                 "Prepare built-in rule fix",
-                key=f"rule_fix_{index}",
+                key=f"rule_fix_{fingerprint}",
                 disabled=workflow_locked,
                 help=(
                     "Prepare a narrowly scoped local fix for this recognized Semgrep rule. "
@@ -154,23 +264,38 @@ def render_findings(findings: list[dict]) -> None:
             st.code(diff, language="diff")
             if st.button(
                 "Approve and apply this patch",
-                key=f"approve_patch_{index}",
+                key=f"approve_patch_{fingerprint}",
                 type="primary",
                 disabled=workflow_locked,
                 help="Apply the diff you reviewed to this project on a new Git branch.",
             ):
                 try:
                     patch_file = validate_patch(root, diff)
+                    if patch_file.casefold() != str(finding.get("path", "")).casefold():
+                        raise PatchError(
+                            "The proposed diff must modify the source file that contains this finding."
+                        )
                     branch = apply_approved_patch(root, diff)
                     st.session_state["last_patch_branch"] = branch
                     st.session_state["last_patch_root"] = str(root)
                     st.session_state["last_patch_file"] = patch_file
+                    st.session_state["last_patch_finding"] = {
+                        "source": sources,
+                        "title": title or finding.get("check_id", "Security finding"),
+                        "path": finding.get("path", ""),
+                        "line": location,
+                    }
                     st.session_state.pop("post_patch_result", None)
                     st.session_state.pop("post_patch_findings", None)
                     st.session_state.pop("post_patch_scan_report", None)
                     st.session_state.pop("created_pr_result", None)
                     st.session_state.pop("merge_result", None)
+                    st.session_state.pop("scan_report", None)
+                    st.session_state.pop("scan_error", None)
                     st.session_state.pop("findings", None)
+                    st.session_state.pop("full_review_findings", None)
+                    st.session_state.pop("full_review_root", None)
+                    st.session_state.pop("full_review_prompts", None)
                     st.session_state.pop("analysis", None)
                     st.session_state.pop("gemini_prompt", None)
                     for key in list(st.session_state):
@@ -228,6 +353,12 @@ def render_post_patch_checks() -> None:
         return
 
     st.subheader("Post-patch checks")
+    applied_finding = st.session_state.get("last_patch_finding")
+    if applied_finding:
+        st.info(
+            f"Fix under review: **{applied_finding['title']}** "
+            f"({applied_finding['source']}) at `{applied_finding['path']}:{applied_finding['line']}`."
+        )
     root = Path(root_value)
     target_file = st.session_state.get("last_patch_file")
     setup = detect_test_setup(root, target_file)
@@ -359,9 +490,17 @@ def render_draft_pr(branch: str) -> None:
         "SentinEX will commit and push this approved single-file fix branch, then ask GitHub MCP "
         "to open a draft PR. You can run local checks afterward and explicitly approve any merge."
     )
+    applied_finding = st.session_state.get("last_patch_finding", {})
+    finding_note = ""
+    if applied_finding:
+        finding_note = (
+            f"- Finding: {applied_finding['title']} "
+            f"({applied_finding['source']}, {applied_finding['path']}:{applied_finding['line']})\n"
+        )
     default_body = (
         "## SentinEX security fix\n\n"
         f"- Branch: `{branch}`\n"
+        f"{finding_note}"
         "- Restricted Docker tests: pending\n"
         "- Semgrep rescan: pending\n\n"
         "Please review the patch and checks before merging."
@@ -432,6 +571,14 @@ def render_merge_approval(root: Path, pr_info, result, findings: list[dict]) -> 
             "Resolve the scan coverage issue and run the checks again."
         )
         return
+
+    applied_finding = st.session_state.get("last_patch_finding", {})
+    finding_source = applied_finding.get("source", "")
+    if "Gemini Full AI Review" in finding_source and "Semgrep" not in finding_source:
+        st.warning(
+            "This fix came from a Gemini-only finding. Semgrep has no matching finding to "
+            "confirm; review the proposed diff and Docker test output before merging."
+        )
 
     if findings:
         acknowledge_findings = st.checkbox(
@@ -529,13 +676,20 @@ def main() -> None:
             st.session_state["last_patch_branch"] = pending_branch
             st.session_state["last_patch_root"] = str(selected_root)
             st.session_state["last_patch_file"] = pending_file
+            st.session_state["last_patch_finding"] = {
+                "source": "Previously approved finding",
+                "title": "Security fix",
+                "path": pending_file,
+                "line": "?",
+            }
             for key in (
                 "findings",
                 "scan_report",
                 "scan_error",
                 "analysis",
                 "gemini_prompt",
-                "full_review",
+                "full_review_findings",
+                "full_review_root",
                 "full_review_prompts",
             ):
                 st.session_state.pop(key, None)
@@ -586,17 +740,16 @@ def main() -> None:
             "scan_report",
             "scan_error",
             "analysis",
-            "full_review",
             "gemini_prompt",
             "last_patch_branch",
             "last_patch_root",
             "last_patch_file",
+            "last_patch_finding",
             "post_patch_result",
             "post_patch_findings",
             "post_patch_scan_report",
             "created_pr_result",
             "merge_result",
-            "full_review_prompts",
         ):
             st.session_state.pop(key, None)
         try:
@@ -646,7 +799,11 @@ def main() -> None:
             root = resolve_project_root(project_path)
             prompts = full_review_prompts(root)
             st.session_state["full_review_prompts"] = prompts
-            st.session_state.pop("full_review", None)
+            st.session_state.pop("full_review_findings", None)
+            st.session_state["full_review_root"] = str(root)
+            for key in list(st.session_state):
+                if key.startswith("patch_proposal_"):
+                    del st.session_state[key]
             st.session_state["project_root"] = str(root)
             if not api_key_configured():
                 st.error("Add your Gemini API key to .env before requesting a full review.")
@@ -654,7 +811,9 @@ def main() -> None:
                 st.info("No eligible source files were found for a full AI review.")
             else:
                 with st.spinner(f"Gemini is reviewing {len(prompts)} bounded code chunk(s)..."):
-                    st.session_state["full_review"] = review_prompts(prompts)
+                    st.session_state["full_review_findings"] = review_prompts(root, prompts)
+                finding_count = len(st.session_state["full_review_findings"])
+                st.success(f"Full AI Review produced {finding_count} trackable finding(s).")
         except (OSError, ValueError, AIReviewError) as error:
             st.error(f"Full AI Review failed: {error}")
         except Exception as error:
@@ -664,15 +823,42 @@ def main() -> None:
         st.session_state.get("last_patch_branch")
         and not st.session_state.get("merge_result")
     )
-    findings = st.session_state.get("findings", [])
-    if findings and not workflow_locked:
-        render_gemini_analysis(Path(st.session_state["project_root"]), findings)
-        render_findings(findings)
+    semgrep_findings = st.session_state.get("findings", [])
+    reviewed_root = st.session_state.get("full_review_root")
+    same_reviewed_project = False
+    gemini_findings = []
+    if reviewed_root:
+        try:
+            same_reviewed_project = (
+                Path(reviewed_root).resolve() == Path(project_path).resolve()
+            )
+        except (OSError, RuntimeError):
+            same_reviewed_project = False
+        if same_reviewed_project:
+            gemini_findings = st.session_state.get("full_review_findings", [])
+    full_review_complete = bool(
+        same_reviewed_project and st.session_state.get("full_review_findings") is not None
+    )
+    if full_review_complete and not workflow_locked:
+        ai_findings = st.session_state["full_review_findings"]
+        st.subheader("Full AI Review")
+        st.success(f"Gemini returned {len(ai_findings)} trackable finding(s).")
+        st.caption(
+            "AI-only findings are model-generated leads. Review their evidence and proposed diffs; "
+            "Semgrep may not have a rule to verify them."
+        )
+        if not ai_findings:
+            st.info("Gemini reported no actionable findings in the reviewed source chunks.")
+    if semgrep_findings and not workflow_locked:
+        render_gemini_analysis(Path(st.session_state["project_root"]), semgrep_findings)
+    actionable_findings = link_review_findings(semgrep_findings, gemini_findings)
+    if actionable_findings and not workflow_locked:
+        render_findings(actionable_findings)
     render_post_patch_checks()
     if st.session_state.get("analysis"):
         st.subheader("Gemini analysis")
         st.markdown(st.session_state["analysis"])
-    full_prompts = st.session_state.get("full_review_prompts", [])
+    full_prompts = st.session_state.get("full_review_prompts", []) if full_review_complete else []
     if full_prompts:
         st.subheader("Full AI review preview")
         st.caption(
@@ -682,10 +868,6 @@ def main() -> None:
         )
         with st.expander("Preview all full-review chunks"):
             st.code("\n\n".join(full_prompts), language="text")
-    if st.session_state.get("full_review"):
-        st.subheader("Full AI Review")
-        st.markdown(st.session_state["full_review"])
-
     st.divider()
     st.caption(
         "An approved patch changes the selected repository locally on a new Git branch. "

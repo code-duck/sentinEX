@@ -14,7 +14,7 @@ Its intended first users are AI-assisted solo developers and small software team
 - Shows the diff and changes the selected project only after the developer approves it. Patch application is restricted to a clean Git repository, a new SentinEX branch, and one file.
 - After patch approval, offers a separate confirmation to push the branch and create a GitHub draft PR.
 - After draft PR creation, detects common test setups and suggests a relevant command. The developer reviews and approves the exact Docker image and command; SentinEX then runs it in Docker and rescans with Semgrep. A merge action is available only after tests pass and the developer explicitly approves it. Remaining findings must be acknowledged.
-- Provides **Get full AI review** as a separate action. Clicking it sends eligible source code to Gemini in bounded chunks; the app displays the prepared chunks after that request. Review code and secrets policy before using this action.
+- Provides **Get full AI review** as a separate action. Gemini returns structured findings with file paths, line numbers, evidence, impact, remediation, severity, and confidence. SentinEX only keeps findings that point to eligible files and valid line numbers. Gemini-only findings receive patch cards and can use the same approval, PR, Docker test, rescan, and merge workflow. Findings at the same file and line can be linked to Semgrep results. Review code and secrets policy before using this action.
 - Includes Windows desktop launch and stop scripts. The launcher hides the console, opens the local dashboard, and saves server output in `logs/` (the five most recent launch sessions are retained).
 
 ## Supported code and scan boundaries
@@ -33,13 +33,13 @@ SentinEX currently selects these source extensions inside the chosen folder:
 
 The selector skips common generated or dependency folders such as `.git`, `.venv`, `node_modules`, `vendor`, `dist`, and `build`. It considers up to 500 files and skips files larger than 1.5 MB. Findings analysis includes a limited nearby-code excerpt. Common inline secret formats and Google API key patterns are redacted, but redaction is not comprehensive.
 
-This prototype focuses on application source code. It does not currently provide full infrastructure-as-code, cloud configuration, CI/CD workflow, dependency/SCA, DAST, or binary scanning. Semgrep and AI review can miss vulnerabilities or report false positives.
+This prototype focuses on application source code. It does not currently provide full infrastructure-as-code, cloud configuration, CI/CD workflow, dependency/SCA, DAST, or binary scanning. Semgrep and AI review can miss vulnerabilities or report false positives. Semgrep cannot independently confirm that a Gemini-only finding was fixed.
 
 ## Workflow
 
-1. Choose a local project folder and run **Scan project**.
-2. Inspect Semgrep findings. Expand the Gemini preview before choosing **Analyze with Gemini** to request explanations.
-3. For a finding, choose **Ask Gemini for a patch**. Review the proposed diff; then choose **Approve and apply this patch** if you accept it.
+1. Choose a local project folder and run **Scan project**. Optionally run **Get full AI review** to create trackable Gemini findings from eligible source files.
+2. Inspect findings and their source labels. Gemini findings linked to Semgrep findings appear together; Gemini-only findings remain labeled as AI-generated leads. Expand the Semgrep preview before choosing **Analyze with Gemini** to request explanations.
+3. For a finding, choose **Ask Gemini for a patch**. Review the proposed diff; then choose **Approve and apply this patch** if you accept it. A supported Semgrep finding may also offer a built-in rule fix.
 4. Review and confirm the branch push and draft PR creation in SentinEX. GitHub hosts the PR; open its link to review the actual GitHub diff.
 5. Return to SentinEX and enter the project’s test command and a Docker image that already contains its test dependencies. SentinEX runs tests against a disposable copy, then rescans the patched project.
 6. If the test command passes, inspect the PR, test output, and rescan. Explicitly approve the merge in SentinEX to request a squash merge. SentinEX does not deploy the project.
@@ -121,7 +121,8 @@ On Windows, Semgrep runs in the official Docker image with the selected project 
 - The Gemini API can be temporarily unavailable or overloaded; AI explanation and patch generation then cannot complete.
 - On 503 errors, SentinEX tries configured Gemini fallback models. If all are unavailable, the built-in fixes cover only a few narrowly recognized patterns; they are clearly labeled and are not AI responses.
 - Full AI Review sends code when clicked and only then displays the prepared chunks; it currently has no separate pre-send confirmation screen.
-- The full GitHub PR, Docker test, rescan, and merge sequence has not yet been demonstrated end to end with a successful Gemini patch. Review the draft PR directly on GitHub before approving any merge.
+- Gemini findings depend on the model returning valid file paths and line numbers. SentinEX filters invalid locations, but developers must still verify the issue and review each patch.
+- A clean Semgrep rescan only means the configured Semgrep rules found no remaining matches; it does not validate AI-only findings or prove the project is vulnerability-free.
 - No local/self-hosted model provider, multi-user/team administration, policy management, or enterprise audit console is implemented.
 - Docker resource limits are safeguards, not a complete security boundary.
 
