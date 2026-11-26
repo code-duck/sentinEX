@@ -13,7 +13,7 @@ Its intended first users are AI-assisted solo developers and small software team
 - Provides clearly labeled, local rule-based fallback fixes for recognized `subprocess-shell-true`, Python `eval`, and unverified TLS findings. They are not AI-generated and are shown as diffs for developer approval before any file changes.
 - Shows the diff and changes the selected project only after the developer approves it. Patch application is restricted to a clean Git repository, a new SentinEX branch, and one file.
 - After patch approval, offers a separate confirmation to push the branch and create a GitHub draft PR.
-- After draft PR creation, runs a developer-entered test command in Docker, then rescans with Semgrep. A merge action is available only after tests pass and the developer explicitly approves it. Remaining findings must be acknowledged.
+- After draft PR creation, detects common test setups and suggests a relevant command. The developer reviews and approves the exact Docker image and command; SentinEX then runs it in Docker and rescans with Semgrep. A merge action is available only after tests pass and the developer explicitly approves it. Remaining findings must be acknowledged.
 - Provides **Get full AI review** as a separate action. Clicking it sends eligible source code to Gemini in bounded chunks; the app displays the prepared chunks after that request. Review code and secrets policy before using this action.
 - Includes Windows desktop launch and stop scripts. The launcher hides the console, opens the local dashboard, and saves server output in `logs/` (the five most recent launch sessions are retained).
 
@@ -112,7 +112,7 @@ SentinEX’s own repository is `https://github.com/code-duck/sentinEX`. The inte
 
 ## Docker test limits and caveats
 
-The test runner mounts the selected project read-only, copies it into disposable container storage, disables network access, drops Linux capabilities, sets CPU/memory/process limits, and enforces a timeout. These restrictions reduce risk but do not make arbitrary test commands or images perfectly safe. Use trusted project code, test commands, and container images. A missing image may be downloaded before the offline test container starts.
+The test runner mounts the selected project read-only, copies it into disposable container storage, disables network access, drops Linux capabilities, sets CPU/memory/process limits, and enforces a timeout. SentinEX detects common Python, Node.js, Go, Maven, Gradle, Composer, and Ruby test setups where possible. Test dependencies must already be available in the selected image or project because the test container has no network access. The developer can change the suggested image and command before approving. These restrictions reduce risk but do not make arbitrary test commands or images perfectly safe. Use trusted project code, test commands, and container images. A missing image may be downloaded before the offline test container starts.
 
 On Windows, Semgrep runs in the official Docker image with the selected project mounted read-only. It combines the configured Semgrep registry rules with SentinEX's local YAML rules. SentinEX verifies Semgrep's JSON diagnostics and scanned-file list; a failed or empty scan is shown as a failure rather than a clean result. Registry rules may be fetched over the network.
 
@@ -135,6 +135,7 @@ sentinex/security_rules.yml Local rules for selected common security mistakes
 sentinex/ai_review.py     Gemini explanations, patch proposals, full review
 sentinex/patching.py      Approval-gated local patch application
 sentinex/docker_runner.py Restricted Docker test runner
+sentinex/test_discovery.py Common test-setup detection and command suggestions
 sentinex/github_pr.py     GitHub MCP draft PR and approved merge operations
 sentinex/folder_picker.py Windows folder picker
 launch_sentinex.ps1       Hidden Windows launcher with local log files

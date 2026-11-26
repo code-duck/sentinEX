@@ -21,10 +21,16 @@ from sentinex.github_pr import (
     merge_approved_pull_request,
     publish_as_draft_pr,
 )
-from sentinex.patching import PatchError, apply_approved_patch, detect_pending_patch
+from sentinex.patching import (
+    PatchError,
+    apply_approved_patch,
+    detect_pending_patch,
+    validate_patch,
+)
 from sentinex.project import resolve_project_root
 from sentinex.rule_fixes import propose_rule_based_patch
 from sentinex.scanner import ScanError, scan_project
+from sentinex.test_discovery import detect_test_setup
 
 
 def render_deploy_tooltip() -> None:
@@ -154,9 +160,11 @@ def render_findings(findings: list[dict]) -> None:
                 help="Apply the diff you reviewed to this project on a new Git branch.",
             ):
                 try:
+                    patch_file = validate_patch(root, diff)
                     branch = apply_approved_patch(root, diff)
                     st.session_state["last_patch_branch"] = branch
                     st.session_state["last_patch_root"] = str(root)
+                    st.session_state["last_patch_file"] = patch_file
                     st.session_state.pop("post_patch_result", None)
                     st.session_state.pop("post_patch_findings", None)
                     st.session_state.pop("post_patch_scan_report", None)
@@ -220,27 +228,66 @@ def render_post_patch_checks() -> None:
         return
 
     st.subheader("Post-patch checks")
+    root = Path(root_value)
+    target_file = st.session_state.get("last_patch_file")
+    setup = detect_test_setup(root, target_file)
+    if setup:
+        st.success(f"SentinEX detected: {setup.label}")
+        st.caption(setup.reason)
+        if setup.dependency_note:
+            st.warning(setup.dependency_note)
+        image_default = setup.image
+        command_default = setup.command
+    else:
+        st.warning(
+            "SentinEX couldn't identify a common test setup for this project. "
+            "You can enter the test image and command in Advanced test settings."
+        )
+        image_default = ""
+        command_default = ""
+
+    image_key = f"test_image_{branch}"
+    command_key = f"test_command_{branch}"
+    st.session_state.setdefault(image_key, image_default)
+    st.session_state.setdefault(command_key, command_default)
+    image = st.session_state[image_key]
+    command = st.session_state[command_key]
+    st.markdown("**SentinEX will run this in Docker:**")
+    st.code(f"Image: {image or '(choose an image)'}\nCommand: {command or '(no test command detected)'}")
     st.caption(
-        f"Patch branch: `{branch}`. Tests run in Docker with no network access and a "
-        "read-only source mount copied into disposable container storage. The test image must "
-        "already contain the project’s test tools."
+        "The selected project is copied into a restricted container with network access disabled. "
+        "SentinEX does not install project dependencies."
     )
-    with st.form("post_patch_checks"):
-        image = st.text_input(
-            "Linux Docker image",
-            value="python:3.14-slim",
-            help="Choose an image that already contains your project's test tools.",
+
+    with st.expander("Advanced test settings", expanded=not bool(setup)):
+        st.text_input(
+            "Docker test image",
+            key=image_key,
+            placeholder="For example: python:3.14-slim",
+            help="Choose an image that already contains the project’s test tools and dependencies.",
         )
-        command = st.text_input(
-            "Test command to run",
-            placeholder="For example: python -m pytest -q",
+        st.text_input(
+            "Test command",
+            key=command_key,
+            placeholder="For example: python -m unittest discover -v",
             max_chars=500,
-            help="Enter the test command. It runs in a restricted, offline container copy.",
+            help="Edit the detected command or enter one if SentinEX could not detect tests.",
         )
-        submitted = st.form_submit_button(
-            "Run tests and rescan with Semgrep",
-            help="Run your command in Docker, then scan the patched project again.",
-        )
+
+    image = st.session_state[image_key].strip()
+    command = st.session_state[command_key].strip()
+    approval_hash = f"{image}\0{command}"
+    confirm = st.checkbox(
+        "I approve running this test command on the disposable project copy in Docker.",
+        key=f"approve_tests_{branch}_{abs(hash(approval_hash))}",
+        disabled=not image or not command,
+        help="Review the Docker image and command above before approving the run.",
+    )
+    submitted = st.button(
+        "Run project tests and rescan with Semgrep",
+        disabled=not (confirm and image and command),
+        help="Run the displayed command in Docker, then rescan the patched project with Semgrep.",
+    )
 
     if submitted:
         root = Path(root_value)
@@ -481,6 +528,7 @@ def main() -> None:
             selected_root = resolve_project_root(project_path)
             st.session_state["last_patch_branch"] = pending_branch
             st.session_state["last_patch_root"] = str(selected_root)
+            st.session_state["last_patch_file"] = pending_file
             for key in (
                 "findings",
                 "scan_report",
@@ -542,6 +590,7 @@ def main() -> None:
             "gemini_prompt",
             "last_patch_branch",
             "last_patch_root",
+            "last_patch_file",
             "post_patch_result",
             "post_patch_findings",
             "post_patch_scan_report",
