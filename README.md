@@ -7,9 +7,10 @@ Its intended first users are AI-assisted solo developers and small software team
 ## What it does
 
 - Opens a selected project folder with the Windows folder picker or accepts a path.
-- Runs Semgrep using the `p/security-audit` ruleset. The scanner recognizes rule-matched code patterns; unique code may still contain issues the rules do not cover.
+- Runs Semgrep using `p/security-audit` plus SentinEX's included local rules for common unsafe code patterns. The scanner recognizes rule-matched code patterns; unique code may still contain issues the rules do not cover.
 - Shows findings and a preview of the redacted finding context before **Analyze with Gemini** sends it.
-- Offers **Ask Gemini for a patch** for an individual finding. Gemini proposes a diff; it does not edit files by itself.
+- Offers **Ask Gemini for a patch** for an individual finding. If the configured model returns a 503, SentinEX tries the configured fallback model list. Gemini proposes a diff; it does not edit files by itself.
+- Provides clearly labeled, local rule-based fallback fixes for recognized `subprocess-shell-true`, Python `eval`, and unverified TLS findings. They are not AI-generated and are shown as diffs for developer approval before any file changes.
 - Shows the diff and changes the selected project only after the developer approves it. Patch application is restricted to a clean Git repository, a new SentinEX branch, and one file.
 - After patch approval, offers a separate confirmation to push the branch and create a GitHub draft PR.
 - After draft PR creation, runs a developer-entered test command in Docker, then rescans with Semgrep. A merge action is available only after tests pass and the developer explicitly approves it. Remaining findings must be acknowledged.
@@ -51,7 +52,7 @@ Scanning, patch application, and Docker test execution operate on the developer�
 | --- | --- |
 | Python | Project scoping, orchestration, patch validation, Git and API workflow |
 | Streamlit | Local browser dashboard |
-| Semgrep CE | Local static analysis with `p/security-audit` |
+| Semgrep CE | Static analysis with `p/security-audit` plus SentinEX's local YAML rules |
 | Gemini API (`google-genai`) | Finding explanations, patch proposals, optional whole-project review |
 | Git for Windows | Local branches, commits, and pushing approved changes |
 | Docker Desktop | Semgrep fallback, GitHub MCP container, and restricted test runner |
@@ -62,7 +63,7 @@ Gemini is the only AI provider currently implemented. A self-hosted model option
 ## Requirements
 
 - Windows 10/11, Python 3.14, and Git for Windows.
-- Docker Desktop with the Linux engine running. SentinEX uses it for restricted test runs and the GitHub MCP server; it may also use Docker when Windows blocks the local Semgrep executable.
+- Docker Desktop with the Linux engine running. On Windows, SentinEX runs Semgrep in Docker, as well as restricted test runs and the GitHub MCP server.
 - A Gemini API key for explanations, patches, and full AI review. A Gemini consumer subscription does not itself include API usage; API terms and billing/quota depend on the Google AI Studio project.
 - For PR operations, a GitHub fine-grained token limited to the target repository, with repository metadata read access, contents read/write, and pull requests read/write. Git’s configured credential manager is used to push the branch; the token is passed to the GitHub MCP container for PR operations.
 
@@ -82,6 +83,7 @@ Edit `.env` locally:
 ```dotenv
 GEMINI_API_KEY=your_google_ai_studio_key
 GEMINI_MODEL=gemini-3.8-flash
+GEMINI_FALLBACK_MODELS=gemini-3.5-flash-lite
 GITHUB_PERSONAL_ACCESS_TOKEN=your_repository_scoped_token
 ```
 
@@ -112,11 +114,12 @@ SentinEX’s own repository is `https://github.com/code-duck/sentinEX`. The inte
 
 The test runner mounts the selected project read-only, copies it into disposable container storage, disables network access, drops Linux capabilities, sets CPU/memory/process limits, and enforces a timeout. These restrictions reduce risk but do not make arbitrary test commands or images perfectly safe. Use trusted project code, test commands, and container images. A missing image may be downloaded before the offline test container starts.
 
-If Windows blocks the local Semgrep executable, the fallback uses the official Semgrep Docker image. That scan may contact Semgrep’s rule registry to fetch the configured rules; the selected source folder is mounted read-only and is not uploaded by SentinEX as a source archive.
+On Windows, Semgrep runs in the official Docker image with the selected project mounted read-only. It combines the configured Semgrep registry rules with SentinEX's local YAML rules. SentinEX verifies Semgrep's JSON diagnostics and scanned-file list; a failed or empty scan is shown as a failure rather than a clean result. Registry rules may be fetched over the network.
 
 ## Current prototype limitations
 
 - The Gemini API can be temporarily unavailable or overloaded; AI explanation and patch generation then cannot complete.
+- On 503 errors, SentinEX tries configured Gemini fallback models. If all are unavailable, the built-in fixes cover only a few narrowly recognized patterns; they are clearly labeled and are not AI responses.
 - Full AI Review sends code when clicked and only then displays the prepared chunks; it currently has no separate pre-send confirmation screen.
 - The full GitHub PR, Docker test, rescan, and merge sequence has not yet been demonstrated end to end with a successful Gemini patch. Review the draft PR directly on GitHub before approving any merge.
 - No local/self-hosted model provider, multi-user/team administration, policy management, or enterprise audit console is implemented.
@@ -128,6 +131,7 @@ If Windows blocks the local Semgrep executable, the fallback uses the official S
 app.py                    Streamlit dashboard and workflow
 sentinex/project.py       Selected-folder boundaries, source selection, redaction
 sentinex/scanner.py       Semgrep scan and Docker fallback
+sentinex/security_rules.yml Local rules for selected common security mistakes
 sentinex/ai_review.py     Gemini explanations, patch proposals, full review
 sentinex/patching.py      Approval-gated local patch application
 sentinex/docker_runner.py Restricted Docker test runner

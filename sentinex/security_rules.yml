@@ -1,0 +1,60 @@
+rules:
+  - id: sentinex.python.eval-detected
+    languages: [python]
+    severity: ERROR
+    message: >-
+      eval() executes a string as Python code. Avoid evaluating untrusted input;
+      parse data with a safe format or a purpose-built parser.
+    metadata:
+      category: security
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
+      confidence: HIGH
+    pattern: eval(...)
+
+  - id: sentinex.python.unverified-ssl-context
+    languages: [python]
+    severity: ERROR
+    message: >-
+      This SSL context disables certificate verification, allowing an attacker
+      to impersonate a server. Use ssl.create_default_context().
+    metadata:
+      category: security
+      cwe: "CWE-295: Improper Certificate Validation"
+      confidence: HIGH
+    pattern: ssl._create_unverified_context(...)
+
+  - id: sentinex.python.requests-tls-verification-disabled
+    languages: [python]
+    severity: ERROR
+    message: >-
+      Disabling TLS certificate verification makes HTTPS vulnerable to
+      man-in-the-middle attacks. Keep verification enabled.
+    metadata:
+      category: security
+      cwe: "CWE-295: Improper Certificate Validation"
+      confidence: MEDIUM
+    pattern: requests.$METHOD(..., verify=False, ...)
+
+  - id: sentinex.javascript.eval-detected
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      eval() executes a string as code. Avoid evaluating untrusted input and use
+      a data parser or a purpose-built operation instead.
+    metadata:
+      category: security
+      cwe: "CWE-95: Improper Neutralization of Directives in Dynamically Evaluated Code"
+      confidence: HIGH
+    pattern: eval(...)
+
+  - id: sentinex.javascript.tls-verification-disabled
+    languages: [javascript, typescript]
+    severity: ERROR
+    message: >-
+      Disabling TLS certificate verification allows an attacker to impersonate
+      a server. Keep certificate validation enabled.
+    metadata:
+      category: security
+      cwe: "CWE-295: Improper Certificate Validation"
+      confidence: MEDIUM
+    pattern: "rejectUnauthorized: false"

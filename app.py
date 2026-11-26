@@ -21,8 +21,9 @@ from sentinex.github_pr import (
     merge_approved_pull_request,
     publish_as_draft_pr,
 )
-from sentinex.patching import PatchError, apply_approved_patch
+from sentinex.patching import PatchError, apply_approved_patch, detect_pending_patch
 from sentinex.project import resolve_project_root
+from sentinex.rule_fixes import propose_rule_based_patch
 from sentinex.scanner import ScanError, scan_project
 
 
@@ -74,6 +75,10 @@ def browse_project_folder() -> None:
 
 def render_findings(findings: list[dict]) -> None:
     """Render scanner results and approval-gated patch actions."""
+    workflow_locked = bool(
+        st.session_state.get("last_patch_branch")
+        and not st.session_state.get("merge_result")
+    )
     st.subheader("Semgrep findings")
     rows = []
     for finding in findings:
@@ -87,9 +92,9 @@ def render_findings(findings: list[dict]) -> None:
         })
     st.dataframe(rows, use_container_width=True, hide_index=True)
 
-    st.subheader("AI-proposed patches")
+    st.subheader("Proposed patches")
     st.caption(
-        "Inspect each diff. SentinEX applies it only after you approve, "
+        "Inspect each diff and its source. SentinEX applies it only after you approve, "
         "and only to a clean Git repository on a new branch."
     )
     root = Path(st.session_state["project_root"])
@@ -101,8 +106,13 @@ def render_findings(findings: list[dict]) -> None:
             if st.button(
                 "Ask Gemini for a patch",
                 key=f"request_patch_{index}",
-                disabled=not api_key_configured(),
-                help="Ask Gemini to suggest a fix for this finding. It will not change your files.",
+                disabled=not api_key_configured() or workflow_locked,
+                help=(
+                    "Ask Gemini to suggest a fix. Finish the current patch's PR workflow "
+                    "before starting another patch."
+                    if workflow_locked
+                    else "Ask Gemini to suggest a fix for this finding. It will not change your files."
+                ),
             ):
                 try:
                     with st.spinner("Gemini is drafting a minimal diff..."):
@@ -112,9 +122,23 @@ def render_findings(findings: list[dict]) -> None:
                 except Exception as error:
                     st.error(f"Patch proposal failed: {error}")
 
+            rule_patch = propose_rule_based_patch(root, finding)
+            if rule_patch is not None and st.button(
+                "Prepare built-in rule fix",
+                key=f"rule_fix_{index}",
+                disabled=workflow_locked,
+                help=(
+                    "Prepare a narrowly scoped local fix for this recognized Semgrep rule. "
+                    "It is not AI-generated and will not change files until you approve it."
+                ),
+            ):
+                st.session_state[proposal_key] = rule_patch
+
             proposal = st.session_state.get(proposal_key)
             if not proposal:
                 continue
+            if proposal.get("source"):
+                st.info(proposal["source"])
             st.write(proposal.get("summary", ""))
             diff = proposal.get("diff", "")
             if not diff:
@@ -126,6 +150,7 @@ def render_findings(findings: list[dict]) -> None:
                 "Approve and apply this patch",
                 key=f"approve_patch_{index}",
                 type="primary",
+                disabled=workflow_locked,
                 help="Apply the diff you reviewed to this project on a new Git branch.",
             ):
                 try:
@@ -134,8 +159,15 @@ def render_findings(findings: list[dict]) -> None:
                     st.session_state["last_patch_root"] = str(root)
                     st.session_state.pop("post_patch_result", None)
                     st.session_state.pop("post_patch_findings", None)
+                    st.session_state.pop("post_patch_scan_report", None)
                     st.session_state.pop("created_pr_result", None)
                     st.session_state.pop("merge_result", None)
+                    st.session_state.pop("findings", None)
+                    st.session_state.pop("analysis", None)
+                    st.session_state.pop("gemini_prompt", None)
+                    for key in list(st.session_state):
+                        if key.startswith("patch_proposal_"):
+                            del st.session_state[key]
                     st.success(f"Patch applied on branch {branch}.")
                 except PatchError as error:
                     st.error(f"Patch not applied: {error}")
@@ -212,14 +244,25 @@ def render_post_patch_checks() -> None:
 
     if submitted:
         root = Path(root_value)
-        for key in ("post_patch_result", "post_patch_findings", "merge_result"):
+        for key in (
+            "post_patch_result",
+            "post_patch_findings",
+            "post_patch_scan_report",
+            "merge_result",
+        ):
             st.session_state.pop(key, None)
         try:
             with st.spinner("Running the approved command in a restricted Docker container..."):
                 result = run_restricted_tests(root, image, command)
             st.session_state["post_patch_result"] = result
             with st.spinner("Rescanning the patched project with Semgrep..."):
-                st.session_state["post_patch_findings"] = scan_project(root)
+                scan_report = scan_project(root)
+                st.session_state["post_patch_findings"] = scan_report.findings
+                st.session_state["post_patch_scan_report"] = {
+                    "files": len(scan_report.scanned_files),
+                    "engine": scan_report.engine,
+                    "skipped": scan_report.skipped_files,
+                }
         except (DockerTestError, ScanError, OSError, ValueError) as error:
             st.error(f"Post-patch check failed: {error}")
         except Exception as error:
@@ -235,7 +278,13 @@ def render_post_patch_checks() -> None:
 
     rescanned = st.session_state.get("post_patch_findings")
     if rescanned is not None:
-        st.write(f"Post-patch Semgrep findings: {len(rescanned)}")
+        scan_meta = st.session_state.get("post_patch_scan_report", {})
+        st.write(
+            f"Post-patch Semgrep findings: {len(rescanned)} "
+            f"({scan_meta.get('files', 0)} files scanned with {scan_meta.get('engine', 'Semgrep')})"
+        )
+        if scan_meta.get("skipped"):
+            st.warning(f"Semgrep skipped {len(scan_meta['skipped'])} file(s); review coverage before merging.")
         if rescanned:
             st.dataframe(
                 [
@@ -329,6 +378,14 @@ def render_merge_approval(root: Path, pr_info, result, findings: list[dict]) -> 
         st.info("The Docker tests did not pass, so SentinEX will not offer a merge action.")
         return
 
+    scan_meta = st.session_state.get("post_patch_scan_report", {})
+    if scan_meta.get("skipped"):
+        st.error(
+            "Semgrep skipped source files, so SentinEX will not offer a merge action. "
+            "Resolve the scan coverage issue and run the checks again."
+        )
+        return
+
     if findings:
         acknowledge_findings = st.checkbox(
             f"I reviewed the rescan and accept that {len(findings)} Semgrep finding(s) remain.",
@@ -391,9 +448,9 @@ def main() -> None:
         )
         st.caption("Eligible source files are read only inside this folder.")
         st.caption(
-            "Semgrep runs locally when available. If Windows blocks its executable, "
-            "SentinEX can run it from the official Docker image; that fallback may contact "
-            "Semgrep's rule registry, with your project mounted read-only."
+            "On Windows, Semgrep runs in a resource-limited Docker container. The selected "
+            "project is mounted read-only; Semgrep may contact its rule registry. SentinEX "
+            "also runs its included local security rules."
         )
         ai_ready = api_key_configured()
         st.divider()
@@ -402,59 +459,140 @@ def main() -> None:
         st.write(f"GitHub MCP token: {'configured' if github_ready else 'not configured'}")
         st.caption("Full AI Review sends eligible source files to Gemini in bounded chunks.")
 
-    scan_column, review_column = st.columns(2)
-    with scan_column:
-        scan_clicked = st.button(
-            "Scan project",
-            type="primary",
-            use_container_width=True,
-            help="Run Semgrep on eligible files in the selected folder and list its findings.",
-        )
-    with review_column:
-        full_review_clicked = st.button(
-            "Get full AI review",
-            use_container_width=True,
-            help="Send eligible source files in bounded chunks to Gemini for a broader review.",
-        )
-
-    if scan_clicked:
+    pending_patch = None
+    if project_path and not st.session_state.get("last_patch_branch"):
         try:
-            root = resolve_project_root(project_path)
-            with st.spinner("Scanning the selected project with Semgrep..."):
-                findings = scan_project(root)
-            st.session_state["project_root"] = str(root)
-            st.session_state["findings"] = findings
-            st.session_state.pop("analysis", None)
-            st.session_state.pop("full_review", None)
-            st.session_state.pop("gemini_prompt", None)
+            selected_root = resolve_project_root(project_path)
+            pending_patch = detect_pending_patch(selected_root)
+        except (OSError, ValueError):
+            pending_patch = None
+    if pending_patch:
+        pending_branch, pending_file = pending_patch
+        st.warning(
+            f"Found an uncommitted change to `{pending_file}` on `{pending_branch}`. "
+            "This looks like a patch SentinEX already applied. Resume its PR workflow "
+            "instead of applying another patch."
+        )
+        if st.button(
+            "Resume this patch's PR workflow",
+            key="resume_pending_patch",
+            help="Restore the current SentinEX branch in the dashboard; this does not commit or push it.",
+        ):
+            selected_root = resolve_project_root(project_path)
+            st.session_state["last_patch_branch"] = pending_branch
+            st.session_state["last_patch_root"] = str(selected_root)
             for key in (
-                "last_patch_branch",
-                "last_patch_root",
-                "post_patch_result",
-                "post_patch_findings",
-                "created_pr_result",
-                "merge_result",
+                "findings",
+                "scan_report",
+                "scan_error",
+                "analysis",
+                "gemini_prompt",
+                "full_review",
                 "full_review_prompts",
             ):
                 st.session_state.pop(key, None)
             for key in list(st.session_state):
                 if key.startswith("patch_proposal_"):
                     del st.session_state[key]
+            st.rerun()
 
-            st.success(f"Scan complete: {len(findings)} finding(s).")
-            if not findings:
-                st.info(
-                    "Semgrep returned no findings for this ruleset. "
-                    "That does not prove the project is vulnerability-free."
-                )
-            else:
+    workflow_locked = bool(pending_patch) or bool(
+        st.session_state.get("last_patch_branch")
+        and not st.session_state.get("merge_result")
+    )
+    scan_column, review_column = st.columns(2)
+    with scan_column:
+        scan_clicked = st.button(
+            "Scan project",
+            type="primary",
+            use_container_width=True,
+            disabled=workflow_locked,
+            help=(
+                "Finish the active patch's PR and checks before starting another scan."
+                if workflow_locked
+                else "Run Semgrep on eligible files in the selected folder and list its findings."
+            ),
+        )
+    with review_column:
+        full_review_clicked = st.button(
+            "Get full AI review",
+            use_container_width=True,
+            disabled=workflow_locked,
+            help=(
+                "Finish the active patch's PR and checks before starting another review."
+                if workflow_locked
+                else "Send eligible source files in bounded chunks to Gemini for a broader review."
+            ),
+        )
+
+    if workflow_locked:
+        st.info(
+            f"A patch is already applied on branch `{st.session_state['last_patch_branch']}`. "
+            "Continue with its draft PR and checks below; SentinEX will enable another scan "
+            "after the merge is complete."
+        )
+
+    if scan_clicked and not workflow_locked:
+        for key in (
+            "findings",
+            "scan_report",
+            "scan_error",
+            "analysis",
+            "full_review",
+            "gemini_prompt",
+            "last_patch_branch",
+            "last_patch_root",
+            "post_patch_result",
+            "post_patch_findings",
+            "post_patch_scan_report",
+            "created_pr_result",
+            "merge_result",
+            "full_review_prompts",
+        ):
+            st.session_state.pop(key, None)
+        try:
+            root = resolve_project_root(project_path)
+            with st.spinner("Scanning the selected project with Semgrep..."):
+                report = scan_project(root)
+            findings = report.findings
+            st.session_state["project_root"] = str(root)
+            st.session_state["findings"] = findings
+            st.session_state["scan_report"] = {
+                "files": len(report.scanned_files),
+                "engine": report.engine,
+                "skipped": report.skipped_files,
+            }
+            for key in list(st.session_state):
+                if key.startswith("patch_proposal_"):
+                    del st.session_state[key]
+            if findings:
                 st.session_state["gemini_prompt"] = findings_prompt(root, findings)
         except (OSError, ValueError, ScanError, AIReviewError) as error:
-            st.error(f"Scan failed: {error}")
+            st.session_state["scan_error"] = str(error)
         except Exception as error:
-            st.error(f"Scan failed: {error}")
+            st.session_state["scan_error"] = f"Unexpected scan failure: {error}"
 
-    if full_review_clicked:
+    scan_report = st.session_state.get("scan_report")
+    if scan_report:
+        finding_count = len(st.session_state.get("findings", []))
+        st.success(
+            f"Semgrep scanned {scan_report['files']} eligible file(s) with "
+            f"{scan_report['engine']} and found {finding_count} finding(s)."
+        )
+        if scan_report.get("skipped"):
+            st.warning(
+                f"Semgrep skipped {len(scan_report['skipped'])} file(s). "
+                "Review scan coverage before relying on these results."
+            )
+        if finding_count == 0:
+            st.info(
+                f"No matches were found in the {scan_report['files']} files Semgrep scanned. "
+                "This does not prove the project is vulnerability-free."
+            )
+    elif st.session_state.get("scan_error"):
+        st.error(f"Scan failed: {st.session_state['scan_error']}")
+
+    if full_review_clicked and not workflow_locked:
         try:
             root = resolve_project_root(project_path)
             prompts = full_review_prompts(root)
@@ -473,8 +611,12 @@ def main() -> None:
         except Exception as error:
             st.error(f"Full AI Review failed: {error}")
 
+    workflow_locked = bool(
+        st.session_state.get("last_patch_branch")
+        and not st.session_state.get("merge_result")
+    )
     findings = st.session_state.get("findings", [])
-    if findings:
+    if findings and not workflow_locked:
         render_gemini_analysis(Path(st.session_state["project_root"]), findings)
         render_findings(findings)
     render_post_patch_checks()

@@ -18,6 +18,11 @@ def get_setting(name: str, default: str = "") -> str:
     return str(file_value) if file_value else default
 
 GEMINI_MODEL = get_setting("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_FALLBACK_MODELS = tuple(
+    model.strip()
+    for model in get_setting("GEMINI_FALLBACK_MODELS", "gemini-3.5-flash-lite").split(",")
+    if model.strip()
+)
 SOURCE_EXTENSIONS = frozenset({".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".php", ".rb"})
 EXCLUDED_DIRECTORIES = frozenset({
     ".git", ".venv", "venv", "node_modules", "vendor", "dist", "build",
