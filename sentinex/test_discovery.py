@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path, PurePosixPath
 import re
 import shlex
@@ -30,15 +31,20 @@ def _inside(root: Path, candidate: Path) -> bool:
 
 def _python_tests(root: Path) -> list[Path]:
     files: list[Path] = []
-    for candidate in root.rglob("*.py"):
-        relative = candidate.relative_to(root)
-        if any(part.lower() in EXCLUDED_DIRECTORIES for part in relative.parts[:-1]):
-            continue
-        if candidate.name.startswith("test_") or candidate.name.endswith("_test.py"):
-            if _inside(root, candidate):
-                files.append(candidate)
-        if len(files) >= 500:
-            break
+    excluded_directories = {name.casefold() for name in EXCLUDED_DIRECTORIES}
+    for current, directories, filenames in os.walk(root, topdown=True):
+        directories[:] = sorted(
+            name for name in directories if name.casefold() not in excluded_directories
+        )
+        for filename in sorted(filenames):
+            if not filename.endswith(".py"):
+                continue
+            if filename.startswith("test_") or filename.endswith("_test.py"):
+                candidate = Path(current) / filename
+                if _inside(root, candidate):
+                    files.append(candidate)
+            if len(files) >= 500:
+                return sorted(files)
     return sorted(files)
 
 

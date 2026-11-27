@@ -1,6 +1,7 @@
 """Small, deterministic remediations for narrowly recognized Semgrep findings."""
 
 import difflib
+import ast as python_ast
 from pathlib import Path, PurePosixPath
 import re
 
@@ -39,6 +40,57 @@ _RULE_FIXES = {
 }
 
 
+def _has_top_level_import(contents: str, module_name: str) -> bool:
+    """Return whether the module imports the requested name without an alias."""
+    try:
+        module = python_ast.parse(contents)
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(statement, python_ast.Import)
+        and any(alias.name == module_name and alias.asname is None for alias in statement.names)
+        for statement in module.body
+    )
+
+
+def _add_top_level_import(contents: str, module_name: str) -> str | None:
+    """Add an import after a module docstring and any future imports."""
+    try:
+        module = python_ast.parse(contents)
+    except SyntaxError:
+        return None
+
+    lines = contents.splitlines(keepends=True)
+    insertion_line = 0
+    body_index = 0
+    if module.body and isinstance(module.body[0], python_ast.Expr):
+        value = module.body[0].value
+        if isinstance(value, python_ast.Constant) and isinstance(value.value, str):
+            insertion_line = module.body[0].end_lineno or 0
+            body_index = 1
+    else:
+        while insertion_line < len(lines):
+            stripped = lines[insertion_line].strip()
+            if stripped and not stripped.startswith("#"):
+                break
+            insertion_line += 1
+
+    for statement in module.body[body_index:]:
+        if isinstance(statement, python_ast.ImportFrom) and statement.module == "__future__":
+            insertion_line = statement.end_lineno or insertion_line
+        else:
+            break
+
+    prefix = "".join(lines[:insertion_line]).rstrip("\r\n")
+    suffix = "".join(lines[insertion_line:]).lstrip("\r\n")
+    import_block = f"import {module_name}\n"
+    if prefix:
+        prefix += "\n\n"
+    if suffix:
+        import_block += "\n"
+    return prefix + import_block + suffix
+
+
 def propose_rule_based_patch(root: Path, finding: dict) -> dict[str, str] | None:
     """Prepare a narrowly scoped offline fix for a recognized finding."""
     rule_fix = _RULE_FIXES.get(str(finding.get("check_id", "")))
@@ -54,11 +106,20 @@ def propose_rule_based_patch(root: Path, finding: dict) -> dict[str, str] | None
     source = project_root.joinpath(*relative_path.parts)
     try:
         source.resolve(strict=True).relative_to(project_root)
-        contents = source.read_bytes().decode("utf-8")
+        contents = (
+            source.read_bytes()
+            .decode("utf-8")
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+        )
         lines = contents.splitlines(keepends=True)
     except (OSError, UnicodeError, ValueError):
         return None
-    if required_source and required_source not in contents:
+    add_import = bool(
+        required_source
+        and not _has_top_level_import(contents, required_source.removeprefix("import "))
+    )
+    if add_import and required_source != "import ast":
         return None
 
     try:
@@ -75,6 +136,11 @@ def propose_rule_based_patch(root: Path, finding: dict) -> dict[str, str] | None
 
     updated_lines = list(lines)
     updated_lines[line_number - 1] = new_line
+    if add_import:
+        updated = _add_top_level_import("".join(updated_lines), "ast")
+        if updated is None:
+            return None
+        updated_lines = updated.splitlines(keepends=True)
     diff = "".join(
         difflib.unified_diff(
             lines,
