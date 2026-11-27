@@ -1,6 +1,7 @@
 """Project-folder boundaries and safe source selection."""
 
 from pathlib import Path
+import os
 import re
 
 from .settings import (
@@ -31,22 +32,25 @@ def resolve_project_root(value: str) -> Path:
 def eligible_source_files(root: Path) -> list[Path]:
     """List source files under root, excluding generated and linked-out files."""
     files: list[Path] = []
-    for candidate in root.rglob("*"):
-        if not candidate.is_file() or candidate.suffix.lower() not in SOURCE_EXTENSIONS:
-            continue
-        relative = candidate.relative_to(root)
-        if any(part.lower() in EXCLUDED_DIRECTORIES for part in relative.parts[:-1]):
-            continue
-        try:
-            resolved = candidate.resolve(strict=True)
-            resolved.relative_to(root)
-            if resolved.stat().st_size > MAX_SOURCE_FILE_BYTES:
+    excluded_directories = {name.casefold() for name in EXCLUDED_DIRECTORIES}
+    for current, directories, filenames in os.walk(root, topdown=True):
+        directories[:] = sorted(
+            name for name in directories if name.casefold() not in excluded_directories
+        )
+        for filename in sorted(filenames):
+            candidate = Path(current) / filename
+            if candidate.suffix.lower() not in SOURCE_EXTENSIONS:
                 continue
-        except (OSError, ValueError):
-            continue
-        files.append(resolved)
-        if len(files) >= MAX_SOURCE_FILES:
-            break
+            try:
+                resolved = candidate.resolve(strict=True)
+                resolved.relative_to(root)
+                if resolved.stat().st_size > MAX_SOURCE_FILE_BYTES:
+                    continue
+            except (OSError, ValueError):
+                continue
+            files.append(resolved)
+            if len(files) >= MAX_SOURCE_FILES:
+                return files
     return files
 
 
